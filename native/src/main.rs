@@ -175,7 +175,12 @@ fn do_poll() -> Snapshot {
             None => Snapshot { ok: false, msg: "Réponse illisible.".into(), ..Default::default() },
         },
         Err(ureq::Error::Status(c, _)) => {
-            Snapshot { ok: false, msg: format!("Auth/HTTP {}", c), ..Default::default() }
+            let msg = match c {
+                401 | 403 => format!("Auth refusée ({}). Relance Claude Code.", c),
+                429 => "Rate limit. Réessai dans quelques minutes.".into(),
+                _ => format!("HTTP {}.", c),
+            };
+            Snapshot { ok: false, msg, ..Default::default() }
         }
         Err(_) => Snapshot { ok: false, msg: "Réseau indisponible.".into(), ..Default::default() },
     }
