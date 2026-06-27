@@ -1,0 +1,25 @@
+# Build outputs
+bin/
+obj/
+target/
+installer-out/
+
+# NuGet
+*.nuget.dgspec.json
+*.nuget.g.props
+*.nuget.g.targets
+project.assets.json
+project.nuget.cache
+
+# Visual Studio
+*.user
+*.suo
+.vs/
+*.wpftmp.csproj
+
+# Executables & installers
+*.exe
+*.msi
+
+# Rust
+Cargo.lock
