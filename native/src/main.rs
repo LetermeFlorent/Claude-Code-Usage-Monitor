@@ -37,15 +37,18 @@ const SEG_COUNT: i32 = 10;
 #[derive(Clone)]
 struct Snapshot {
     ok: bool,
+    local_mode: bool, // true = token counts from local files, false = utilization % from API
     msg: String,
     util5: f64,
     reset5: Option<DateTime<Utc>>,
     util7: f64,
     reset7: Option<DateTime<Utc>>,
+    tokens5: u64,
+    tokens7: u64,
 }
 impl Default for Snapshot {
     fn default() -> Self {
-        Snapshot { ok: false, msg: "Chargement…".into(), util5: 0.0, reset5: None, util7: 0.0, reset7: None }
+        Snapshot { ok: false, local_mode: false, msg: "Chargement…".into(), util5: 0.0, reset5: None, util7: 0.0, reset7: None, tokens5: 0, tokens7: 0 }
     }
 }
 
@@ -56,6 +59,8 @@ struct State {
     show_countdown: bool,
     light: bool,
     secs_to_poll: i64,
+    cap_5h: u64,
+    cap_7d: u64,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -78,13 +83,16 @@ fn load_settings(s: &mut State) {
             if let Some(b) = v.get("pos_left").and_then(|x| x.as_bool()) { s.pos_left = b; }
             if let Some(n) = v.get("poll_secs").and_then(|x| x.as_i64()) { s.poll_secs = n.max(15); }
             if let Some(b) = v.get("show_countdown").and_then(|x| x.as_bool()) { s.show_countdown = b; }
+            if let Some(n) = v.get("cap_5h").and_then(|x| x.as_u64()) { s.cap_5h = n.max(1); }
+            if let Some(n) = v.get("cap_7d").and_then(|x| x.as_u64()) { s.cap_7d = n.max(1); }
         }
     }
 }
 fn save_settings(s: &State) {
     let _ = std::fs::create_dir_all(settings_dir());
     let v = serde_json::json!({
-        "pos_left": s.pos_left, "poll_secs": s.poll_secs, "show_countdown": s.show_countdown
+        "pos_left": s.pos_left, "poll_secs": s.poll_secs, "show_countdown": s.show_countdown,
+        "cap_5h": s.cap_5h, "cap_7d": s.cap_7d
     });
     let _ = std::fs::write(settings_path(), serde_json::to_string_pretty(&v).unwrap_or_default());
 }
@@ -152,14 +160,78 @@ fn parse_window(v: &serde_json::Value, key: &str) -> (f64, Option<DateTime<Utc>>
     (util.clamp(0.0, 1.0), reset)
 }
 
+// ---------- local JSONL reader ----------
+fn read_local(cap_5h: u64, cap_7d: u64) -> Option<Snapshot> {
+    let mut projects_dir = std::path::PathBuf::from(std::env::var("USERPROFILE").ok()?);
+    projects_dir.push(".claude");
+    projects_dir.push("projects");
+
+    let now = Utc::now();
+    let cutoff_7d = now - chrono::Duration::days(7);
+    let cutoff_5h = now - chrono::Duration::hours(5);
+
+    let mut tokens5: u64 = 0;
+    let mut tokens7: u64 = 0;
+    let mut found_any = false;
+
+    let dir = std::fs::read_dir(&projects_dir).ok()?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        let subdir = match std::fs::read_dir(&path) { Ok(d) => d, Err(_) => continue };
+        for file_entry in subdir.flatten() {
+            let fpath = file_entry.path();
+            if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+            // skip files not modified in last 7d
+            if let Ok(meta) = std::fs::metadata(&fpath) {
+                if let Ok(modified) = meta.modified() {
+                    let secs = modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let modified_utc = DateTime::from_timestamp(secs as i64, 0).unwrap_or(now);
+                    if modified_utc < cutoff_7d { continue; }
+                }
+            }
+            let txt = match std::fs::read_to_string(&fpath) { Ok(t) => t, Err(_) => continue };
+            for line in txt.lines() {
+                let v: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+                if v.get("type").and_then(|t| t.as_str()) != Some("assistant") { continue; }
+                let usage = match v.get("usage") { Some(u) => u, None => continue };
+                let ts_str = match v.get("timestamp").and_then(|t| t.as_str()) { Some(s) => s, None => continue };
+                let ts = match DateTime::parse_from_rfc3339(ts_str) { Ok(dt) => dt.with_timezone(&Utc), Err(_) => continue };
+                if ts < cutoff_7d { continue; }
+
+                let tok = usage.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
+                    + usage.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0)
+                    + usage.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                tokens7 += tok;
+                if ts >= cutoff_5h { tokens5 += tok; }
+                found_any = true;
+            }
+        }
+    }
+
+    if !found_any { return None; }
+    let util5 = (tokens5 as f64 / cap_5h as f64).clamp(0.0, 1.0);
+    let util7 = (tokens7 as f64 / cap_7d as f64).clamp(0.0, 1.0);
+    Some(Snapshot { ok: true, local_mode: true, msg: String::new(), util5, reset5: None, util7, reset7: None, tokens5, tokens7 })
+}
+
 fn do_poll() -> Snapshot {
+    let (cap_5h, cap_7d) = { let s = state().lock().unwrap(); (s.cap_5h, s.cap_7d) };
+
     let (token, expired) = match read_token() {
         Some(t) => t,
-        None => return Snapshot { ok: false, msg: "Pas de credentials. Lance Claude Code.".into(), ..Default::default() },
+        None => {
+            // No credentials — still try local files
+            return read_local(cap_5h, cap_7d)
+                .unwrap_or_else(|| Snapshot { ok: false, msg: "Pas de credentials. Lance Claude Code.".into(), ..Default::default() });
+        }
     };
     if expired {
-        return Snapshot { ok: false, msg: "Token expiré. Relance Claude Code.".into(), ..Default::default() };
+        return read_local(cap_5h, cap_7d)
+            .unwrap_or_else(|| Snapshot { ok: false, msg: "Token expiré. Relance Claude Code.".into(), ..Default::default() });
     }
+
+    // Try API first for real utilization %
     let resp = ureq::get("https://api.anthropic.com/api/oauth/usage")
         .set("Authorization", &format!("Bearer {}", token))
         .set("anthropic-beta", "oauth-2025-04-20")
@@ -170,19 +242,19 @@ fn do_poll() -> Snapshot {
             Some(v) => {
                 let (u5, r5) = parse_window(&v, "five_hour");
                 let (u7, r7) = parse_window(&v, "seven_day");
-                Snapshot { ok: true, msg: String::new(), util5: u5, reset5: r5, util7: u7, reset7: r7 }
+                Snapshot { ok: true, local_mode: false, msg: String::new(), util5: u5, reset5: r5, util7: u7, reset7: r7, tokens5: 0, tokens7: 0 }
             }
-            None => Snapshot { ok: false, msg: "Réponse illisible.".into(), ..Default::default() },
+            None => read_local(cap_5h, cap_7d)
+                .unwrap_or_else(|| Snapshot { ok: false, msg: "Réponse API illisible.".into(), ..Default::default() }),
         },
-        Err(ureq::Error::Status(c, _)) => {
-            let msg = match c {
-                401 | 403 => format!("Auth refusée ({}). Relance Claude Code.", c),
-                429 => "Rate limit. Réessai dans quelques minutes.".into(),
-                _ => format!("HTTP {}.", c),
-            };
-            Snapshot { ok: false, msg, ..Default::default() }
+        Err(ureq::Error::Status(401 | 403, _)) => {
+            Snapshot { ok: false, msg: "Auth refusée. Relance Claude Code.".into(), ..Default::default() }
         }
-        Err(_) => Snapshot { ok: false, msg: "Réseau indisponible.".into(), ..Default::default() },
+        Err(_) => {
+            // 429, network error, etc. → fall back to local files silently
+            read_local(cap_5h, cap_7d)
+                .unwrap_or_else(|| Snapshot { ok: false, msg: "API indisponible, données locales vides.".into(), ..Default::default() })
+        }
     }
 }
 
@@ -307,8 +379,8 @@ fn paint(hwnd: HWND) {
         } else {
             let h = rc.bottom - rc.top;
             let row_h = h / 2;
-            draw_row(hdc, rc.left, rc.top, rc.right, row_h, "5h", cur.util5, cur.reset5, light, text_color, muted, false);
-            draw_row(hdc, rc.left, rc.top + row_h, rc.right, row_h, "7d", cur.util7, cur.reset7, light, text_color, muted, show_cd);
+            draw_row(hdc, rc.left, rc.top, rc.right, row_h, "5h", cur.util5, cur.reset5, light, text_color, muted, false, cur.local_mode, cur.tokens5);
+            draw_row(hdc, rc.left, rc.top + row_h, rc.right, row_h, "7d", cur.util7, cur.reset7, light, text_color, muted, show_cd, cur.local_mode, cur.tokens7);
         }
 
         SelectObject(hdc, old_font);
@@ -326,7 +398,8 @@ fn paint(hwnd: HWND) {
 #[allow(clippy::too_many_arguments)]
 fn draw_row(hdc: HDC, left: i32, top: i32, right: i32, height: i32, tag: &str,
             util: f64, reset: Option<DateTime<Utc>>, light: bool,
-            text_color: COLORREF, muted: COLORREF, show_cd: bool) {
+            text_color: COLORREF, muted: COLORREF, show_cd: bool,
+            local_mode: bool, tokens: u64) {
     unsafe {
         let cx = left + 2;
         let mid = top + height / 2;
@@ -362,7 +435,15 @@ fn draw_row(hdc: HDC, left: i32, top: i32, right: i32, height: i32, tag: &str,
         let pct = (util * 100.0).round() as i32;
         let label = if show_cd {
             let secs = state().lock().unwrap().secs_to_poll.max(0);
-            format!("{}%  {}   \u{21bb}{}s", pct, countdown(reset), secs)
+            if local_mode {
+                let k = (tokens as f64 / 1000.0).round() as u64;
+                format!("{}k  {}   \u{21bb}{}s", k, countdown(reset), secs)
+            } else {
+                format!("{}%  {}   \u{21bb}{}s", pct, countdown(reset), secs)
+            }
+        } else if local_mode {
+            let k = (tokens as f64 / 1000.0).round() as u64;
+            format!("{}k tok", k)
         } else {
             format!("{}%  {}", pct, countdown(reset))
         };
@@ -530,6 +611,7 @@ fn main() -> Result<()> {
         STATE.set(Mutex::new(State {
             hwnd: 0, pos_left: false, poll_secs: 60, show_countdown: false,
             light: is_light_taskbar(), secs_to_poll: 1,
+            cap_5h: 500_000, cap_7d: 5_000_000,
         })).ok();
         SNAP.set(Mutex::new(Snapshot::default())).ok();
         { let mut s = state().lock().unwrap(); load_settings(&mut s); s.secs_to_poll = 1; }
